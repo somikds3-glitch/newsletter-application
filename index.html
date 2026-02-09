@@ -112,6 +112,7 @@
                 const [rawNewsItems, setRawNewsItems] = useState([]); // Store all fetched items
                 const [filteredNewsItems, setFilteredNewsItems] = useState([]); // Items after dedupe & display filters
                 const [progress, setProgress] = useState("");
+                const [auditLog, setAuditLog] = useState([]); // Track success/failure per chunk
 
                 // Options
                 const [dedupeMode, setDedupeMode] = useState("strict"); // 'strict' (safe) or 'fuzzy'
@@ -176,6 +177,7 @@
 
                     setStatus("processing");
                     setRawNewsItems([]);
+                    setAuditLog([]); // Reset audit log
                     if (logRef.current) logRef.current.innerHTML = "";
                     addLog("Starting search...");
 
@@ -208,39 +210,81 @@
                     const parser = new DOMParser();
 
                     const runQuery = async (queryType, queryStr, company, chunkDate) => {
-                        const MAX_RETRIES = 5;
+                        // Prioritized Proxy List (Reliable ones first)
+                        const PROXIES = [
+                            (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}&t=${Date.now()}`,
+                            (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+                            (url) => `https://api.cors.lol/?url=${encodeURIComponent(url)}`,
+                            (url) => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(url)}`,
+                            (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
+                        ];
+
+                        // Partial shuffle: keep top 2 fixed, shuffle the rest for fallback variety
+                        for (let i = PROXIES.length - 1; i > 2; i--) {
+                            const j = 2 + Math.floor(Math.random() * (i - 1));
+                            [PROXIES[i], PROXIES[j]] = [PROXIES[j], PROXIES[i]];
+                        }
+
+                        const MAX_RETRIES = PROXIES.length * 2;
                         let attempts = 0;
+
                         while (attempts < MAX_RETRIES) {
+                            const proxyIdx = attempts % PROXIES.length;
+                            const proxyFn = PROXIES[proxyIdx];
+                            const rssUrl = `https://news.google.com/rss/search?q=${queryStr}&hl=en-US&gl=US&ceid=US:en`;
+                            const targetUrl = proxyFn(rssUrl);
+
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s relaxed timeout
+
                             try {
-                                const rssUrl = `https://news.google.com/rss/search?q=${queryStr}&hl=en-US&gl=US&ceid=US:en`;
-                                // USING generic CORS proxy to get RAW XML (bypasses rss2json limits)
-                                const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(rssUrl)}&t=${Date.now()}`;
+                                const res = await fetch(targetUrl, { signal: controller.signal });
+                                clearTimeout(timeoutId);
 
-                                const res = await fetch(proxyUrl);
-                                const data = await res.json(); // allorigins returns JSON with 'contents' string
+                                if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-                                if (data.contents) {
-                                    const xmlDoc = parser.parseFromString(data.contents, "text/xml");
+                                let xmlContent = "";
+                                try {
+                                    const text = await res.text();
+                                    try {
+                                        const data = JSON.parse(text);
+                                        if (data.contents) xmlContent = data.contents;
+                                        else if (data.body) xmlContent = data.body;
+                                        else if (typeof data === 'string') xmlContent = data;
+                                        else xmlContent = text;
+                                    } catch (jsonErr) {
+                                        xmlContent = text;
+                                    }
+                                } catch (readErr) {
+                                    throw new Error(`Read failed: ${readErr.message}`);
+                                }
+
+                                if (xmlContent && (xmlContent.includes("<rss") || xmlContent.includes("<feed") || xmlContent.includes("<?xml"))) {
+                                    const xmlDoc = parser.parseFromString(xmlContent, "text/xml");
                                     const items = xmlDoc.querySelectorAll("item");
 
-                                    addLog(`Found ${items.length} items for ${company} [${queryType}]`);
-                                    return Array.from(items);
-                                } else {
-                                    attempts++;
-                                    if (attempts >= MAX_RETRIES) {
-                                        addLog(`Error: ${company} [${chunkDate}] - No content after ${attempts} attempts`);
+                                    if (items.length > 0) {
+                                        addLog(`Found ${items.length} items for ${company} [${queryType}]`);
+                                        return Array.from(items);
                                     } else {
-                                        addLog(`Retry ${attempts}/${MAX_RETRIES} for ${company} [${chunkDate}]...`);
-                                        await new Promise(r => setTimeout(r, 3000 + Math.random() * 3000));
+                                        addLog(`No items found for ${company} [${queryType}]. Moving to next...`);
+                                        return [];
                                     }
-                                }
-                            } catch (e) {
-                                attempts++;
-                                if (attempts >= MAX_RETRIES) {
-                                    addLog(`Error: ${e.message} - Failed after ${attempts} attempts`);
                                 } else {
-                                    addLog(`Retry ${attempts}/${MAX_RETRIES} for ${company} [${chunkDate}]...`);
-                                    await new Promise(r => setTimeout(r, 3000 + Math.random() * 3000));
+                                    throw new Error("Invalid RSS response");
+                                }
+
+                            } catch (e) {
+                                clearTimeout(timeoutId);
+                                attempts++;
+                                const errorSnippet = e.message.substring(0, 40);
+                                if (attempts >= MAX_RETRIES) {
+                                    addLog(`Error: ${company} - Gave up after ${MAX_RETRIES} attempts.`);
+                                } else {
+                                    const nextDelay = 1500 + Math.random() * 2000;
+                                    // Soft log
+                                    addLog(`Proxy busy (${errorSnippet}). Switching proxy in ${(nextDelay / 1000).toFixed(1)}s...`);
+                                    await new Promise(r => setTimeout(r, nextDelay));
                                 }
                             }
                         }
@@ -259,11 +303,30 @@
                             let qGeneral = encodeURIComponent(`${company} after:${chunk.s} before:${chunk.e}`);
                             const itemsGen = await runQuery("General", qGeneral, company, chunk.s);
 
+                            setAuditLog(prev => [...prev, {
+                                Company: company,
+                                StartDate: chunk.s,
+                                EndDate: chunk.e,
+                                Type: "General",
+                                Status: itemsGen.length >= 0 ? "Success" : "Failed",
+                                ItemsFound: itemsGen.length
+                            }]);
+
                             // 2. Press Release Query
                             completed++;
                             setProgress(`${Math.round((completed / totalSteps) * 100)}% | ${company} (Press Release)`);
                             let qPR = encodeURIComponent(`${company} "press release" after:${chunk.s} before:${chunk.e}`);
                             const itemsPR = await runQuery("Press Release", qPR, company, chunk.s);
+
+                            setAuditLog(prev => [...prev, {
+                                Company: company,
+                                StartDate: chunk.s,
+                                EndDate: chunk.e,
+                                Type: "Press Release",
+                                Status: itemsPR.length >= 0 ? "Success" : "Failed",
+                                ItemsFound: itemsPR.length
+                            }]);
+
 
                             const allItems = [...itemsGen, ...itemsPR];
 
@@ -312,20 +375,33 @@
                     setProgress("");
                 };
 
+
                 const handleDownload = () => {
-                    if (filteredNewsItems.length === 0) return;
-                    const dataForExcel = filteredNewsItems.map(item => ({
-                        Date: item.date.toLocaleDateString(),
-                        Category: item.category,
-                        Company: item.company,
-                        Source: item.source,
-                        Headline: item.title,
-                        Summary: item.summary,
-                        Link: item.link
-                    }));
-                    const ws = XLSX.utils.json_to_sheet(dataForExcel);
+                    if (filteredNewsItems.length === 0 && auditLog.length === 0) return;
+
                     const wb = XLSX.utils.book_new();
-                    XLSX.utils.book_append_sheet(wb, ws, "News");
+
+                    // Sheet 1: News Items
+                    if (filteredNewsItems.length > 0) {
+                        const dataForExcel = filteredNewsItems.map(item => ({
+                            Date: item.date.toLocaleDateString(),
+                            Category: item.category,
+                            Company: item.company,
+                            Source: item.source,
+                            Headline: item.title,
+                            Summary: item.summary,
+                            Link: item.link
+                        }));
+                        const ws = XLSX.utils.json_to_sheet(dataForExcel);
+                        XLSX.utils.book_append_sheet(wb, ws, "News");
+                    }
+
+                    // Sheet 2: Audit Log
+                    if (auditLog.length > 0) {
+                        const auditWs = XLSX.utils.json_to_sheet(auditLog);
+                        XLSX.utils.book_append_sheet(wb, auditWs, "Search Audit");
+                    }
+
                     XLSX.writeFile(wb, "Enhanced_News_Report.xlsx");
                 };
 
