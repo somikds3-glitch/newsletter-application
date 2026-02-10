@@ -150,10 +150,14 @@
                             }
                         });
                     } else {
-                        // Fuzzy Title Match
+                        // Fuzzy Match (Title > 60% OR Summary > 50%)
                         rawNewsItems.forEach(item => {
-                            const exists = unique.some(u => isSimilar(u.title, item.title));
-                            if (!exists) unique.push(item);
+                            const isTitleDuplicate = unique.some(u => isSimilar(u.title, item.title, 0.6));
+                            const isSummaryDuplicate = unique.some(u => isSimilar(u.summary, item.summary, 0.5));
+
+                            if (!isTitleDuplicate && !isSummaryDuplicate) {
+                                unique.push(item);
+                            }
                         });
                     }
 
