@@ -288,10 +288,10 @@
 
             /**
              * Contextual deduplication with hybrid scoring.
-             * Groups items where hybrid similarity >= 50%.
+             * Groups items where hybrid similarity >= 5%.
              * Keeps the most recent item from each group.
              */
-            function contextualDedupe(items, threshold = 0.50) {
+            function contextualDedupe(items, threshold = 0.05) {
                 const enriched = buildTfidfVectors(items);
                 const used = new Array(enriched.length).fill(false);
                 const result = [];
@@ -423,7 +423,7 @@
                         });
                     } else if (dedupeMode === 'contextual') {
                         // Contextual Summary Deduplication (50% TF-IDF cosine similarity)
-                        unique = contextualDedupe(rawNewsItems, 0.50);
+                        unique = contextualDedupe(rawNewsItems, 0.05);
                         const removedCount = rawNewsItems.length - unique.length;
                         if (removedCount > 0) {
                             addLog(`Contextual dedup removed ${removedCount} duplicate(s) from ${rawNewsItems.length} items.`);
@@ -730,7 +730,7 @@
                                         <span className="text-xs font-medium text-slate-500">Deduplication:</span>
                                         <select className="border rounded text-sm p-1 bg-slate-50" value={dedupeMode} onChange={e => setDedupeMode(e.target.value)}>
                                             <option value="strict">Strict (URL only)</option>
-                                            <option value="contextual">Contextual (50% Summary Match)</option>
+                                            <option value="contextual">Contextual (5% Summary Match)</option>
                                             <option value="fuzzy">Legacy Fuzzy (Levenshtein)</option>
                                         </select>
                                         <button onClick={handleDownload} disabled={filteredNewsItems.length === 0} className="ml-4 bg-green-600 text-white px-4 py-1 rounded text-sm hover:bg-green-700">Download Excel</button>
