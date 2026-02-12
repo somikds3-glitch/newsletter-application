@@ -91,28 +91,110 @@
             }
 
             /**
+             * Extract named entities from ORIGINAL (pre-lowercase) text.
+             * Detects: capitalized multi-word names, standalone capitalized words, numbers/amounts.
+             * Returns a Set of lowercase entity strings.
+             */
+            function extractEntities(text) {
+                if (!text) return new Set();
+                const entities = new Set();
+
+                // Multi-word capitalized names: "Shandong Energy", "Goldman Sachs", "New York"
+                const multiWordPattern = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g;
+                let match;
+                while ((match = multiWordPattern.exec(text)) !== null) {
+                    const entity = match[1].toLowerCase();
+                    if (!STOP_WORDS.has(entity)) entities.add(entity);
+                }
+
+                // Single capitalized words (likely proper nouns), min 3 chars
+                const singleCapPattern = /\b([A-Z][a-z]{2,})\b/g;
+                while ((match = singleCapPattern.exec(text)) !== null) {
+                    const w = match[1].toLowerCase();
+                    if (!STOP_WORDS.has(w) && w.length > 3) entities.add(w);
+                }
+
+                // ALL-CAPS acronyms: "CEO", "IPO", "AI", "ESG"
+                const acronymPattern = /\b([A-Z]{2,6})\b/g;
+                while ((match = acronymPattern.exec(text)) !== null) {
+                    entities.add(match[1].toLowerCase());
+                }
+
+                // Dollar/number amounts: "$5B", "500 million", "2024"
+                const amountPattern = /\$[\d.,]+\s*(?:billion|million|trillion|[BMTKk])?|\b\d{4}\b|\b\d+\s*(?:billion|million|trillion)\b/gi;
+                while ((match = amountPattern.exec(text)) !== null) {
+                    entities.add(match[0].toLowerCase().trim());
+                }
+
+                return entities;
+            }
+
+            /**
+             * Generate bigrams from token array.
+             * "nvidia quarterly earnings report" => ["nvidia_quarterly", "quarterly_earnings", "earnings_report"]
+             */
+            function generateBigrams(tokens) {
+                const bigrams = [];
+                for (let i = 0; i < tokens.length - 1; i++) {
+                    bigrams.push(tokens[i] + '_' + tokens[i + 1]);
+                }
+                return bigrams;
+            }
+
+            /**
+             * Jaccard similarity between two Sets.
+             * |intersection| / |union|
+             */
+            function jaccardSimilarity(setA, setB) {
+                if (setA.size === 0 && setB.size === 0) return 0;
+                let intersection = 0;
+                setA.forEach(item => { if (setB.has(item)) intersection++; });
+                const union = setA.size + setB.size - intersection;
+                return union === 0 ? 0 : intersection / union;
+            }
+
+            /**
              * Extract a contextual summary from a news item.
-             * Combines title (weighted 2x) + description, extracts top key terms by frequency.
-             * Returns { terms: [...topTerms], fingerprint: "term1 term2 ..." }
+             * Uses unigrams + bigrams from title (3x weight) and description,
+             * plus extracted named entities (company names, proper nouns, acronyms).
              */
             function extractContextualSummary(item) {
-                // Weight title terms 2x since they carry more meaning
-                const titleTokens = tokenize(item.title || '');
-                const summaryTokens = tokenize(item.summary || '');
-                const allTokens = [...titleTokens, ...titleTokens, ...summaryTokens]; // title counted twice
+                const rawTitle = item.title || '';
+                const rawSummary = item.summary || '';
+
+                // Unigrams
+                const titleTokens = tokenize(rawTitle);
+                const summaryTokens = tokenize(rawSummary);
+
+                // Bigrams for phrase-level matching
+                const titleBigrams = generateBigrams(titleTokens);
+                const summaryBigrams = generateBigrams(summaryTokens);
+
+                // Named entities from original casing
+                const entities = extractEntities(rawTitle + ' ' + rawSummary);
+
+                // Build combined token list: title weighted 3x, bigrams 2x, entities 3x
+                const allTokens = [
+                    ...titleTokens, ...titleTokens, ...titleTokens,  // title 3x
+                    ...summaryTokens,
+                    ...titleBigrams, ...titleBigrams,                 // bigrams 2x
+                    ...summaryBigrams,
+                    ...Array.from(entities), ...Array.from(entities), ...Array.from(entities) // entities 3x
+                ];
 
                 // Build term frequency map
                 const tf = {};
                 allTokens.forEach(t => { tf[t] = (tf[t] || 0) + 1; });
 
-                // Sort by frequency, take top 15 key terms as the contextual summary
+                // Sort by frequency, take top 20 key terms as the contextual summary
                 const sorted = Object.entries(tf).sort((a, b) => b[1] - a[1]);
-                const topTerms = sorted.slice(0, 15).map(([term]) => term);
+                const topTerms = sorted.slice(0, 20).map(([term]) => term);
 
                 return {
                     terms: topTerms,
                     fingerprint: topTerms.join(' '),
-                    termFreq: tf
+                    termFreq: tf,
+                    entities: entities  // Keep entities for hybrid matching
                 };
             }
 
@@ -121,7 +203,6 @@
              * Returns items enriched with .contextSummary and .tfidfVector
              */
             function buildTfidfVectors(items) {
-                // Step 1: Extract contextual summaries and compute document frequencies
                 const enriched = items.map(item => ({
                     ...item,
                     contextSummary: extractContextualSummary(item)
@@ -130,21 +211,20 @@
                 const N = enriched.length;
                 if (N === 0) return enriched;
 
-                // Compute document frequency (how many docs each term appears in)
+                // Compute document frequency
                 const df = {};
                 enriched.forEach(item => {
                     const uniqueTerms = new Set(Object.keys(item.contextSummary.termFreq));
                     uniqueTerms.forEach(term => { df[term] = (df[term] || 0) + 1; });
                 });
 
-                // Step 2: Compute TF-IDF vector for each item
+                // Compute TF-IDF vector for each item
                 enriched.forEach(item => {
                     const vector = {};
                     const tf = item.contextSummary.termFreq;
                     const maxTf = Math.max(...Object.values(tf), 1);
 
                     for (const [term, freq] of Object.entries(tf)) {
-                        // Augmented TF * IDF
                         const normalizedTf = 0.5 + 0.5 * (freq / maxTf);
                         const idf = Math.log((N + 1) / (1 + (df[term] || 0)));
                         vector[term] = normalizedTf * idf;
@@ -157,7 +237,6 @@
 
             /**
              * Cosine similarity between two TF-IDF vectors.
-             * Returns a value between 0 (completely different) and 1 (identical context).
              */
             function cosineSimilarity(vecA, vecB) {
                 const allTerms = new Set([...Object.keys(vecA), ...Object.keys(vecB)]);
@@ -176,7 +255,40 @@
             }
 
             /**
-             * Contextual deduplication: groups items by 50%+ contextual summary similarity.
+             * Hybrid similarity: combines TF-IDF cosine with Jaccard on entities.
+             * Takes the MAX of the two, then applies entity-overlap boost.
+             * This catches same-story articles even when worded differently.
+             */
+            function hybridSimilarity(itemA, itemB) {
+                // 1. TF-IDF cosine similarity (captures term-level overlap)
+                const cosSim = cosineSimilarity(itemA.tfidfVector, itemB.tfidfVector);
+
+                // 2. Jaccard on named entities (captures who/what overlap)
+                const entitySim = jaccardSimilarity(itemA.contextSummary.entities, itemB.contextSummary.entities);
+
+                // 3. Jaccard on top key terms (captures topic overlap)
+                const termsA = new Set(itemA.contextSummary.terms);
+                const termsB = new Set(itemB.contextSummary.terms);
+                const termsSim = jaccardSimilarity(termsA, termsB);
+
+                // Take the best signal
+                let score = Math.max(cosSim, entitySim, termsSim);
+
+                // 4. Entity overlap boost: if >=2 named entities match, boost by +0.15
+                let sharedEntities = 0;
+                itemA.contextSummary.entities.forEach(e => {
+                    if (itemB.contextSummary.entities.has(e)) sharedEntities++;
+                });
+                if (sharedEntities >= 2) {
+                    score = Math.min(1.0, score + 0.15);
+                }
+
+                return score;
+            }
+
+            /**
+             * Contextual deduplication with hybrid scoring.
+             * Groups items where hybrid similarity >= 50%.
              * Keeps the most recent item from each group.
              */
             function contextualDedupe(items, threshold = 0.50) {
@@ -196,7 +308,7 @@
                     const duplicates = [];
                     for (const { item: other, idx: oIdx } of indexed) {
                         if (used[oIdx] || oIdx === cIdx) continue;
-                        const sim = cosineSimilarity(candidate.tfidfVector, other.tfidfVector);
+                        const sim = hybridSimilarity(candidate, other);
                         if (sim >= threshold) {
                             used[oIdx] = true;
                             duplicates.push({ ...other, similarity: Math.round(sim * 100) });
