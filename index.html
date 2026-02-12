@@ -56,6 +56,166 @@
 
             // --- UTILS ---
 
+            // Stop words for contextual analysis
+            const STOP_WORDS = new Set([
+                'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', "aren't", 'as', 'at',
+                'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', "can't", 'cannot', 'could',
+                "couldn't", 'did', "didn't", 'do', 'does', "doesn't", 'doing', "don't", 'down', 'during', 'each', 'few', 'for',
+                'from', 'further', 'get', 'got', 'had', "hadn't", 'has', "hasn't", 'have', "haven't", 'having', 'he', "he'd",
+                "he'll", "he's", 'her', 'here', "here's", 'hers', 'herself', 'him', 'himself', 'his', 'how', "how's", 'i', "i'd",
+                "i'll", "i'm", "i've", 'if', 'in', 'into', 'is', "isn't", 'it', "it's", 'its', 'itself', 'just', "let's", 'me',
+                'might', 'more', 'most', "mustn't", 'my', 'myself', 'no', 'nor', 'not', 'of', 'off', 'on', 'once', 'only', 'or',
+                'other', 'ought', 'our', 'ours', 'ourselves', 'out', 'over', 'own', 'same', "shan't", 'she', "she'd", "she'll",
+                "she's", 'should', "shouldn't", 'so', 'some', 'such', 'than', 'that', "that's", 'the', 'their', 'theirs', 'them',
+                'themselves', 'then', 'there', "there's", 'these', 'they', "they'd", "they'll", "they're", "they've", 'this',
+                'those', 'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was', "wasn't", 'we', "we'd", "we'll", "we're",
+                "we've", 'were', "weren't", 'what', "what's", 'when', "when's", 'where', "where's", 'which', 'while', 'who',
+                "who's", 'whom', 'why', "why's", 'will', 'with', "won't", 'would', "wouldn't", 'you', "you'd", "you'll",
+                "you're", "you've", 'your', 'yours', 'yourself', 'yourselves',
+                'also', 'new', 'said', 'says', 'one', 'two', 'like', 'will', 'can', 'may', 'use', 'used', 'using',
+                'news', 'report', 'reports', 'article', 'according', 'first', 'last', 'next', 'still', 'well',
+                'however', 'another', 'since', 'around', 'back', 'even', 'much', 'many', 'made', 'make', 'take', 'every'
+            ]);
+
+            /**
+             * Tokenize text: lowercase, remove punctuation, split into words, filter stop words.
+             * Returns array of meaningful tokens.
+             */
+            function tokenize(text) {
+                if (!text) return [];
+                return text
+                    .toLowerCase()
+                    .replace(/[^a-z0-9\s]/g, ' ')
+                    .split(/\s+/)
+                    .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+            }
+
+            /**
+             * Extract a contextual summary from a news item.
+             * Combines title (weighted 2x) + description, extracts top key terms by frequency.
+             * Returns { terms: [...topTerms], fingerprint: "term1 term2 ..." }
+             */
+            function extractContextualSummary(item) {
+                // Weight title terms 2x since they carry more meaning
+                const titleTokens = tokenize(item.title || '');
+                const summaryTokens = tokenize(item.summary || '');
+                const allTokens = [...titleTokens, ...titleTokens, ...summaryTokens]; // title counted twice
+
+                // Build term frequency map
+                const tf = {};
+                allTokens.forEach(t => { tf[t] = (tf[t] || 0) + 1; });
+
+                // Sort by frequency, take top 15 key terms as the contextual summary
+                const sorted = Object.entries(tf).sort((a, b) => b[1] - a[1]);
+                const topTerms = sorted.slice(0, 15).map(([term]) => term);
+
+                return {
+                    terms: topTerms,
+                    fingerprint: topTerms.join(' '),
+                    termFreq: tf
+                };
+            }
+
+            /**
+             * Build TF-IDF vectors for a collection of items.
+             * Returns items enriched with .contextSummary and .tfidfVector
+             */
+            function buildTfidfVectors(items) {
+                // Step 1: Extract contextual summaries and compute document frequencies
+                const enriched = items.map(item => ({
+                    ...item,
+                    contextSummary: extractContextualSummary(item)
+                }));
+
+                const N = enriched.length;
+                if (N === 0) return enriched;
+
+                // Compute document frequency (how many docs each term appears in)
+                const df = {};
+                enriched.forEach(item => {
+                    const uniqueTerms = new Set(Object.keys(item.contextSummary.termFreq));
+                    uniqueTerms.forEach(term => { df[term] = (df[term] || 0) + 1; });
+                });
+
+                // Step 2: Compute TF-IDF vector for each item
+                enriched.forEach(item => {
+                    const vector = {};
+                    const tf = item.contextSummary.termFreq;
+                    const maxTf = Math.max(...Object.values(tf), 1);
+
+                    for (const [term, freq] of Object.entries(tf)) {
+                        // Augmented TF * IDF
+                        const normalizedTf = 0.5 + 0.5 * (freq / maxTf);
+                        const idf = Math.log((N + 1) / (1 + (df[term] || 0)));
+                        vector[term] = normalizedTf * idf;
+                    }
+                    item.tfidfVector = vector;
+                });
+
+                return enriched;
+            }
+
+            /**
+             * Cosine similarity between two TF-IDF vectors.
+             * Returns a value between 0 (completely different) and 1 (identical context).
+             */
+            function cosineSimilarity(vecA, vecB) {
+                const allTerms = new Set([...Object.keys(vecA), ...Object.keys(vecB)]);
+                let dotProduct = 0, magA = 0, magB = 0;
+
+                allTerms.forEach(term => {
+                    const a = vecA[term] || 0;
+                    const b = vecB[term] || 0;
+                    dotProduct += a * b;
+                    magA += a * a;
+                    magB += b * b;
+                });
+
+                const magnitude = Math.sqrt(magA) * Math.sqrt(magB);
+                return magnitude === 0 ? 0 : dotProduct / magnitude;
+            }
+
+            /**
+             * Contextual deduplication: groups items by 50%+ contextual summary similarity.
+             * Keeps the most recent item from each group.
+             */
+            function contextualDedupe(items, threshold = 0.50) {
+                const enriched = buildTfidfVectors(items);
+                const used = new Array(enriched.length).fill(false);
+                const result = [];
+
+                // Sort by date descending so we prefer keeping the most recent
+                const indexed = enriched.map((item, i) => ({ item, idx: i }));
+                indexed.sort((a, b) => b.item.date - a.item.date);
+
+                for (const { item: candidate, idx: cIdx } of indexed) {
+                    if (used[cIdx]) continue;
+                    used[cIdx] = true;
+
+                    // Find all items similar to this candidate
+                    const duplicates = [];
+                    for (const { item: other, idx: oIdx } of indexed) {
+                        if (used[oIdx] || oIdx === cIdx) continue;
+                        const sim = cosineSimilarity(candidate.tfidfVector, other.tfidfVector);
+                        if (sim >= threshold) {
+                            used[oIdx] = true;
+                            duplicates.push({ ...other, similarity: Math.round(sim * 100) });
+                        }
+                    }
+
+                    // Attach duplicate count and contextual summary to the kept item
+                    result.push({
+                        ...candidate,
+                        contextFingerprint: candidate.contextSummary.fingerprint,
+                        duplicateCount: duplicates.length,
+                        duplicateTitles: duplicates.slice(0, 3).map(d => `${d.title} (${d.similarity}% match)`)
+                    });
+                }
+
+                return result;
+            }
+
+            // Legacy Levenshtein for the old fuzzy mode
             function levenshtein(a, b) {
                 if (a.length === 0) return b.length;
                 if (b.length === 0) return a.length;
@@ -77,7 +237,7 @@
                 return matrix[b.length][a.length];
             }
 
-            function isSimilar(s1, s2, threshold = 0.6) { // Lower threshold for headlines
+            function isSimilar(s1, s2, threshold = 0.6) {
                 if (!s1 || !s2) return false;
                 const longer = s1.length > s2.length ? s1 : s2;
                 if (longer.length === 0) return true;
@@ -115,7 +275,7 @@
                 const [auditLog, setAuditLog] = useState([]); // Track success/failure per chunk
 
                 // Options
-                const [dedupeMode, setDedupeMode] = useState("strict"); // 'strict' (safe) or 'fuzzy'
+                const [dedupeMode, setDedupeMode] = useState("contextual"); // 'strict', 'contextual', or 'fuzzy'
                 const [filterCategory, setFilterCategory] = useState("All");
                 const [filterSource, setFilterSource] = useState("All");
 
@@ -146,17 +306,24 @@
                         rawNewsItems.forEach(item => {
                             if (!seen.has(item.link)) {
                                 seen.add(item.link);
-                                unique.push(item);
+                                unique.push({ ...item, duplicateCount: 0, duplicateTitles: [], contextFingerprint: '' });
                             }
                         });
+                    } else if (dedupeMode === 'contextual') {
+                        // Contextual Summary Deduplication (50% TF-IDF cosine similarity)
+                        unique = contextualDedupe(rawNewsItems, 0.50);
+                        const removedCount = rawNewsItems.length - unique.length;
+                        if (removedCount > 0) {
+                            addLog(`Contextual dedup removed ${removedCount} duplicate(s) from ${rawNewsItems.length} items.`);
+                        }
                     } else {
-                        // Fuzzy Match (Title > 60% OR Summary > 50%)
+                        // Legacy Fuzzy Match (Title > 60% OR Summary > 50%)
                         rawNewsItems.forEach(item => {
                             const isTitleDuplicate = unique.some(u => isSimilar(u.title, item.title, 0.6));
                             const isSummaryDuplicate = unique.some(u => isSimilar(u.summary, item.summary, 0.5));
 
                             if (!isTitleDuplicate && !isSummaryDuplicate) {
-                                unique.push(item);
+                                unique.push({ ...item, duplicateCount: 0, duplicateTitles: [], contextFingerprint: '' });
                             }
                         });
                     }
@@ -450,8 +617,9 @@
                                     <div className="flex items-center gap-2">
                                         <span className="text-xs font-medium text-slate-500">Deduplication:</span>
                                         <select className="border rounded text-sm p-1 bg-slate-50" value={dedupeMode} onChange={e => setDedupeMode(e.target.value)}>
-                                            <option value="strict">Strict (Safe - Keep All)</option>
-                                            <option value="fuzzy">Smart (Remove Similar)</option>
+                                            <option value="strict">Strict (URL only)</option>
+                                            <option value="contextual">Contextual (50% Summary Match)</option>
+                                            <option value="fuzzy">Legacy Fuzzy (Levenshtein)</option>
                                         </select>
                                         <button onClick={handleDownload} disabled={filteredNewsItems.length === 0} className="ml-4 bg-green-600 text-white px-4 py-1 rounded text-sm hover:bg-green-700">Download Excel</button>
                                     </div>
@@ -507,6 +675,18 @@
                                                         <div className="text-xs text-slate-500 line-clamp-2" title={item.summary}>
                                                             {item.summary}
                                                         </div>
+                                                        {dedupeMode === 'contextual' && item.contextFingerprint && (
+                                                            <div className="mt-1 flex flex-wrap gap-1">
+                                                                {item.contextFingerprint.split(' ').slice(0, 8).map((term, ti) => (
+                                                                    <span key={ti} className="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 text-[10px] rounded font-mono">{term}</span>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        {item.duplicateCount > 0 && (
+                                                            <div className="mt-1 text-[11px] text-amber-600 bg-amber-50 px-2 py-1 rounded" title={item.duplicateTitles?.join('\n')}>
+                                                                ⚡ {item.duplicateCount} similar article{item.duplicateCount > 1 ? 's' : ''} merged
+                                                            </div>
+                                                        )}
                                                     </td>
                                                 </tr>
                                             ))}
